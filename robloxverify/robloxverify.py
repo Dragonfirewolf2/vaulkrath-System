@@ -1,5 +1,7 @@
 import discord
 import aiohttp
+import asyncio
+import os
 import random
 from datetime import datetime
 from redbot.core import commands, Config
@@ -72,7 +74,6 @@ async def roblox_group_rank(roblox_id, group_id):
 # ─────────── Bloxlink helpers ───────────
 
 async def bloxlink_discord_to_roblox(discord_id, guild_id, api_key):
-    """Returns roblox_id (int) or None."""
     if not api_key:
         return None
     url = f"{BLOXLINK_BASE}/guilds/{guild_id}/discord-to-roblox/{discord_id}"
@@ -84,7 +85,6 @@ async def bloxlink_discord_to_roblox(discord_id, guild_id, api_key):
 
 
 async def bloxlink_roblox_to_discord(roblox_id, guild_id, api_key):
-    """Returns list of discord ids (ints)."""
     if not api_key:
         return []
     url = f"{BLOXLINK_BASE}/guilds/{guild_id}/roblox-to-discord/{roblox_id}"
@@ -101,6 +101,34 @@ async def bloxlink_update_user(discord_id, guild_id, api_key):
     url = f"{BLOXLINK_BASE}/guilds/{guild_id}/update-user/{discord_id}"
     data = await fetch_json(url, method="POST", json_body={}, headers={"Authorization": api_key})
     return data is not None
+
+
+# ─────────── rblx-open-cloud (optional, for auto-ranking) ───────────
+
+async def roblox_set_rank(roblox_user_id, rank_name, api_key, group_id):
+    """Set a user's rank in a Roblox group using rblx-open-cloud. Returns (ok, msg)."""
+    if not api_key:
+        return False, "ROBLOX_API_KEY not set"
+
+    def _do():
+        import rblxopencloud
+        group = rblxopencloud.Group(group_id, api_key)
+        target_role = None
+        for role in group.list_roles():
+            if role.name.lower() == rank_name.lower():
+                target_role = role
+                break
+        if not target_role:
+            raise ValueError(f"Rank '{rank_name}' not found in group {group_id}")
+        group.update_member(roblox_user_id, target_role.id)
+
+    try:
+        await asyncio.to_thread(_do)
+        return True, "OK"
+    except ImportError:
+        return False, "rblx-open-cloud not installed — run: pip install rblx-open-cloud"
+    except Exception as e:
+        return False, str(e)
 
 
 # ─────────── UI ───────────
@@ -157,7 +185,7 @@ class ConfirmView(discord.ui.View):
 # ─────────── Cog ───────────
 
 class RobloxVerify(commands.Cog):
-    """Roblox account verification with optional Bloxlink integration."""
+    """Roblox account verification with Bloxlink + multi-guild role sync."""
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -165,42 +193,133 @@ class RobloxVerify(commands.Cog):
         self.config.register_user(
             roblox_id=None,
             roblox_username=None,
+            rank_name=None,
             verified_at=None,
         )
         self.config.register_guild(
             verified_role=None,
             apply_nickname=True,
             bloxlink_api_key=None,
-            group_id=None,  # optional: roblox group id to track rank
+            group_id=None,
+            rank_role_bindings={},   # dict: rank_name -> role_id
+            include_in_sync=True,    # whether to include this guild in cross-guild sync
         )
 
-    # ─────────── Storage ───────────
+    # ─────────── Public methods (used by other cogs) ───────────
 
-    async def save_verified(self, discord_id, roblox_id, roblox_username):
+    async def get_verified_data(self, discord_id: int):
+        """Return {'roblox_id', 'roblox_username', 'rank_name', 'verified_at'} or None."""
+        try:
+            user = self.bot.get_user(discord_id) or await self.bot.fetch_user(discord_id)
+        except discord.HTTPException:
+            return None
+        data = await self.config.user(user).all()
+        if not data.get("roblox_id"):
+            return None
+        return data
+
+    async def save_verified(self, discord_id: int, roblox_id, roblox_username: str, rank_name: str = None):
+        """Persist a Discord ↔ Roblox link. rank_name is optional."""
         user = self.bot.get_user(discord_id) or await self.bot.fetch_user(discord_id)
         await self.config.user(user).roblox_id.set(str(roblox_id))
         await self.config.user(user).roblox_username.set(roblox_username)
         await self.config.user(user).verified_at.set(datetime.utcnow().isoformat())
+        if rank_name is not None:
+            await self.config.user(user).rank_name.set(rank_name)
 
-    async def _apply_role_and_nick(self, member: discord.Member, username: str):
+    async def apply_roles_in_guild(self, member: discord.Member, roblox_username: str, rank_name: str = None):
+        """Apply verified role, rank role (if bound), and nickname in this one guild. Returns status string."""
         guild = member.guild
-        role_id = await self.config.guild(guild).verified_role()
-        do_nick = await self.config.guild(guild).apply_nickname()
+        cfg = await self.config.guild(guild).all()
 
-        if role_id:
-            role = guild.get_role(role_id)
-            if role and role not in member.roles:
-                try:
-                    await member.add_roles(role, reason="Roblox verified")
-                except discord.HTTPException:
-                    pass
+        roles_to_add = []
+        roles_to_remove = []
 
-        if do_nick and guild.me and guild.me.guild_permissions.manage_nicknames:
+        # Verified role
+        verified_role_id = cfg.get("verified_role")
+        if verified_role_id:
+            vr = guild.get_role(verified_role_id)
+            if vr and vr not in member.roles:
+                roles_to_add.append(vr)
+
+        # Rank roles: remove all bound rank roles except the one that matches rank_name
+        rank_bindings = cfg.get("rank_role_bindings") or {}
+        target_rank_role = None
+        if rank_name:
+            target_rid = rank_bindings.get(rank_name)
+            if target_rid:
+                target_rank_role = guild.get_role(target_rid)
+
+        for rname, rid in rank_bindings.items():
+            role = guild.get_role(rid)
+            if not role:
+                continue
+            if role == target_rank_role:
+                if role not in member.roles:
+                    roles_to_add.append(role)
+            else:
+                if role in member.roles:
+                    roles_to_remove.append(role)
+
+        try:
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason=f"Roblox sync: {rank_name or 'verified'}")
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason=f"Roblox sync: {rank_name or 'verified'}")
+        except discord.Forbidden:
+            return "No permission"
+        except discord.HTTPException as e:
+            return f"Error: {e}"
+
+        # Nickname
+        if cfg.get("apply_nickname", True) and guild.me and guild.me.guild_permissions.manage_nicknames:
             try:
-                if member.top_role < guild.me.top_role and member != guild.owner:
-                    await member.edit(nick=username, reason="Roblox verified")
+                if member != guild.owner and member.top_role < guild.me.top_role:
+                    await member.edit(nick=roblox_username, reason="Roblox verified")
             except discord.HTTPException:
                 pass
+
+        return "OK"
+
+    async def apply_roles_everywhere(self, discord_id: int, roblox_username: str, rank_name: str = None):
+        """
+        Apply roles and nickname across every guild the bot is in that has:
+          - verified_role set, AND
+          - include_in_sync = True
+        Returns dict: {guild_name: status}
+        """
+        results = {}
+        for guild in self.bot.guilds:
+            cfg = await self.config.guild(guild).all()
+            if not cfg.get("verified_role"):
+                continue
+            if not cfg.get("include_in_sync", True):
+                continue
+            member = guild.get_member(discord_id)
+            if not member:
+                results[guild.name] = "Not in server"
+                continue
+            results[guild.name] = await self.apply_roles_in_guild(member, roblox_username, rank_name)
+        return results
+
+    async def rank_on_roblox(self, roblox_id: int, rank_name: str, guild: discord.Guild = None, group_id: int = None):
+        """
+        Set a user's rank on a Roblox group via rblx-open-cloud.
+        group_id defaults to the configured group for `guild` if not provided.
+        Requires ROBLOX_API_KEY env var.
+        """
+        if group_id is None and guild is not None:
+            group_id = await self.config.guild(guild).group_id()
+        if not group_id:
+            return False, "No Roblox group_id configured"
+        api_key = os.environ.get("ROBLOX_API_KEY", "")
+        return await roblox_set_rank(roblox_id, rank_name, api_key, group_id)
+
+    # ─────────── Internal ───────────
+
+    async def _auto_sync_after_verify(self, discord_id: int, roblox_username: str, rank_name: str = None):
+        """Called after a verify — runs role/nick sync across all configured guilds."""
+        await self.apply_roles_everywhere(discord_id, roblox_username, rank_name)
 
     # ─────────── User commands ───────────
 
@@ -210,7 +329,7 @@ class RobloxVerify(commands.Cog):
         Verify your Roblox account.
 
         If your server has Bloxlink configured and you're already Bloxlink-verified,
-        it links instantly. Otherwise, provide your Roblox username to do profile-code
+        it links instantly. Otherwise provide your Roblox username to do profile-code
         verification.
         """
         if ctx.guild is None:
@@ -224,15 +343,20 @@ class RobloxVerify(commands.Cog):
                 user_data = await roblox_user_by_id(roblox_id)
                 if user_data:
                     roblox_name = user_data.get("name", str(roblox_id))
-                    await self.save_verified(ctx.author.id, roblox_id, roblox_name)
-                    if isinstance(ctx.author, discord.Member):
-                        await self._apply_role_and_nick(ctx.author, roblox_name)
+                    group_id = await self.config.guild(ctx.guild).group_id()
+                    rank_info = await roblox_group_rank(roblox_id, group_id) if group_id else None
+                    rank_name = rank_info["name"] if rank_info else None
+
+                    await self.save_verified(ctx.author.id, roblox_id, roblox_name, rank_name)
+                    await self._auto_sync_after_verify(ctx.author.id, roblox_name, rank_name)
+
                     embed = discord.Embed(
                         title="Verified via Bloxlink",
                         description=(
                             f"**Roblox:** {roblox_name}\n"
                             f"**ID:** `{roblox_id}`\n"
-                            f"[Profile](https://www.roblox.com/users/{roblox_id}/profile)"
+                            + (f"**Group rank:** {rank_name}\n" if rank_name else "")
+                            + f"[Profile](https://www.roblox.com/users/{roblox_id}/profile)"
                         ),
                         color=0x57f287,
                     )
@@ -279,8 +403,14 @@ class RobloxVerify(commands.Cog):
         await ctx.send(embed=embed, view=view, ephemeral=True)
 
         await view.wait()
-        if view.verified and isinstance(ctx.author, discord.Member):
-            await self._apply_role_and_nick(ctx.author, roblox_name)
+        if view.verified:
+            # Optionally fetch group rank at this point too
+            group_id = await self.config.guild(ctx.guild).group_id()
+            rank_info = await roblox_group_rank(roblox_id, group_id) if group_id else None
+            rank_name = rank_info["name"] if rank_info else None
+            if rank_name:
+                await self.save_verified(ctx.author.id, roblox_id, roblox_name, rank_name)
+            await self._auto_sync_after_verify(ctx.author.id, roblox_name, rank_name)
 
     @commands.hybrid_command(name="whois", description="Show the Roblox account linked to a Discord user")
     async def whois(self, ctx: commands.Context, member: discord.Member = None):
@@ -288,7 +418,6 @@ class RobloxVerify(commands.Cog):
         member = member or ctx.author
         data = await self.config.user(member).all()
 
-        # Fall back to Bloxlink if not in our DB
         if not data.get("roblox_id") and ctx.guild:
             api_key = await self.config.guild(ctx.guild).bloxlink_api_key()
             if api_key:
@@ -299,6 +428,7 @@ class RobloxVerify(commands.Cog):
                         data = {
                             "roblox_id": str(roblox_id),
                             "roblox_username": user_data.get("name"),
+                            "rank_name": None,
                         }
 
         if not data.get("roblox_id"):
@@ -316,13 +446,14 @@ class RobloxVerify(commands.Cog):
             color=0x57f287,
         )
 
-        # Include group rank if configured
         if ctx.guild:
             group_id = await self.config.guild(ctx.guild).group_id()
             if group_id:
                 rank = await roblox_group_rank(int(roblox_id), group_id)
                 if rank:
                     embed.add_field(name="Group Rank", value=f"{rank['name']} ({rank['rank']})", inline=False)
+                elif data.get("rank_name"):
+                    embed.add_field(name="Stored rank", value=data["rank_name"], inline=False)
 
         avatar = await roblox_avatar(int(roblox_id))
         if avatar:
@@ -331,17 +462,16 @@ class RobloxVerify(commands.Cog):
 
     @commands.hybrid_command(name="whoisroblox", description="Find who a Roblox ID belongs to in this server")
     async def whoisroblox(self, ctx: commands.Context, roblox_id: int):
-        """Reverse lookup: find Discord users linked to a Roblox ID (uses Bloxlink)."""
+        """Reverse lookup via Bloxlink."""
         if ctx.guild is None:
             return await ctx.send("Run this in a server.")
         api_key = await self.config.guild(ctx.guild).bloxlink_api_key()
         if not api_key:
-            return await ctx.send("Bloxlink reverse lookup isn't configured on this server.", ephemeral=True)
+            return await ctx.send("Bloxlink reverse lookup isn't configured.", ephemeral=True)
 
         ids = await bloxlink_roblox_to_discord(roblox_id, ctx.guild.id, api_key)
         if not ids:
-            return await ctx.send(f"No Discord users found linked to Roblox ID `{roblox_id}`.", ephemeral=True)
-
+            return await ctx.send(f"No Discord users linked to Roblox ID `{roblox_id}`.", ephemeral=True)
         mentions = " ".join(f"<@{i}>" for i in ids)
         await ctx.send(f"Roblox `{roblox_id}` → {mentions}")
 
@@ -353,7 +483,7 @@ class RobloxVerify(commands.Cog):
             return await ctx.send("Run this in a server.")
         api_key = await self.config.guild(ctx.guild).bloxlink_api_key()
         if not api_key:
-            return await ctx.send("Bloxlink isn't configured on this server.", ephemeral=True)
+            return await ctx.send("Bloxlink isn't configured.", ephemeral=True)
 
         member = member or ctx.author
         ok = await bloxlink_update_user(member.id, ctx.guild.id, api_key)
@@ -361,6 +491,35 @@ class RobloxVerify(commands.Cog):
             await ctx.send(f"✅ Bloxlink re-synced {member.mention}.")
         else:
             await ctx.send(f"❌ Bloxlink re-sync failed for {member.mention}.")
+
+    @commands.hybrid_command(name="rupdate", description="Re-sync your Roblox roles/rank everywhere")
+    async def rupdate(self, ctx: commands.Context, member: discord.Member = None):
+        """Refresh a user's roles, rank, and nickname across all configured guilds."""
+        member = member or ctx.author
+        data = await self.config.user(member).all()
+        if not data.get("roblox_id"):
+            return await ctx.send(f"{member.mention} isn't verified yet.", ephemeral=True)
+
+        roblox_id = int(data["roblox_id"])
+        username = data.get("roblox_username") or str(roblox_id)
+
+        # Re-fetch group rank if group is configured
+        rank_name = data.get("rank_name")
+        if ctx.guild:
+            group_id = await self.config.guild(ctx.guild).group_id()
+            if group_id:
+                rank_info = await roblox_group_rank(roblox_id, group_id)
+                if rank_info:
+                    rank_name = rank_info["name"]
+                    await self.config.user(member).rank_name.set(rank_name)
+
+        results = await self.apply_roles_everywhere(member.id, username, rank_name)
+        results_text = "\n".join(f"{g}: {s}" for g, s in results.items()) or "No guilds configured."
+        embed = discord.Embed(title="Updated", color=0x57f287)
+        embed.add_field(name="User", value=member.mention, inline=True)
+        embed.add_field(name="Rank", value=rank_name or "—", inline=True)
+        embed.add_field(name="Synced in", value=results_text, inline=False)
+        await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="unverify", description="Remove your Roblox verification")
     async def unverify(self, ctx: commands.Context):
@@ -376,11 +535,7 @@ class RobloxVerify(commands.Cog):
 
     @rverifyset.command(name="bloxlinkkey")
     async def set_bloxlink_key(self, ctx: commands.Context, *, api_key: str = None):
-        """Set (or clear) this server's Bloxlink API key.
-
-        Get one at https://blox.link/dashboard/user/developer
-        Tip: delete your message afterwards to keep the key private.
-        """
+        """Set or clear this server's Bloxlink API key. Get one at https://blox.link/dashboard/user/developer"""
         if api_key is None:
             await self.config.guild(ctx.guild).bloxlink_api_key.set(None)
             return await ctx.send("Bloxlink API key cleared.")
@@ -393,7 +548,7 @@ class RobloxVerify(commands.Cog):
 
     @rverifyset.command(name="role")
     async def set_role(self, ctx: commands.Context, role: discord.Role = None):
-        """Set the role given to verified users."""
+        """Set (or clear) the role given to verified users."""
         if role is None:
             await self.config.guild(ctx.guild).verified_role.set(None)
             return await ctx.send("Verified role cleared.")
@@ -402,27 +557,59 @@ class RobloxVerify(commands.Cog):
 
     @rverifyset.command(name="nickname")
     async def set_nick(self, ctx: commands.Context, on_off: bool):
-        """Toggle auto-setting verified users' nicknames to their Roblox username."""
+        """Toggle auto-setting nicknames to Roblox usernames."""
         await self.config.guild(ctx.guild).apply_nickname.set(on_off)
         await ctx.send(f"Nickname on verify: **{'on' if on_off else 'off'}**.")
 
     @rverifyset.command(name="group")
     async def set_group(self, ctx: commands.Context, group_id: int = None):
-        """Set a Roblox group ID to show rank info in /whois (0 to clear)."""
+        """Set the Roblox group ID to track ranks (0 to clear)."""
         if group_id in (None, 0):
             await self.config.guild(ctx.guild).group_id.set(None)
             return await ctx.send("Group tracking cleared.")
         await self.config.guild(ctx.guild).group_id.set(group_id)
         await ctx.send(f"Group ID set to `{group_id}`.")
 
+    @rverifyset.command(name="rankrole")
+    async def set_rank_role(self, ctx: commands.Context, rank_name: str, role: discord.Role = None):
+        """Bind a Roblox rank name to a Discord role. Pass no role to clear the binding.
+
+        Example: `[p]rverifyset rankrole Newborn @Newborn`
+        """
+        async with self.config.guild(ctx.guild).rank_role_bindings() as bindings:
+            if role is None:
+                if rank_name in bindings:
+                    del bindings[rank_name]
+                    return await ctx.send(f"Cleared binding for rank `{rank_name}`.")
+                return await ctx.send(f"No binding exists for rank `{rank_name}`.")
+            bindings[rank_name] = role.id
+        await ctx.send(f"Bound rank **{rank_name}** → {role.mention}.")
+
+    @rverifyset.command(name="syncinclude")
+    async def set_sync(self, ctx: commands.Context, on_off: bool):
+        """Include this server in cross-guild role sync (default: on)."""
+        await self.config.guild(ctx.guild).include_in_sync.set(on_off)
+        await ctx.send(f"Cross-guild sync for this server: **{'on' if on_off else 'off'}**.")
+
     @rverifyset.command(name="show")
     async def show(self, ctx: commands.Context):
         """Show current settings for this server."""
         data = await self.config.guild(ctx.guild).all()
         role = ctx.guild.get_role(data["verified_role"]) if data["verified_role"] else None
+
+        bindings_text = "None"
+        if data.get("rank_role_bindings"):
+            lines = []
+            for rname, rid in data["rank_role_bindings"].items():
+                r = ctx.guild.get_role(rid)
+                lines.append(f"• {rname} → {r.mention if r else f'`{rid}` (missing)'}")
+            bindings_text = "\n".join(lines)
+
         embed = discord.Embed(title="RobloxVerify Settings", color=0x5865f2)
         embed.add_field(name="Verified role", value=role.mention if role else "Not set", inline=False)
         embed.add_field(name="Apply nickname", value="Yes" if data["apply_nickname"] else "No", inline=False)
         embed.add_field(name="Group ID", value=str(data["group_id"]) if data["group_id"] else "Not set", inline=False)
         embed.add_field(name="Bloxlink key", value="✅ Set" if data["bloxlink_api_key"] else "❌ Not set", inline=False)
-        await ctx.send(embed=embed)
+        embed.add_field(name="Include in cross-guild sync", value="Yes" if data.get("include_in_sync", True) else "No", inline=False)
+        embed.add_field(name="Rank → Role bindings", value=bindings_text, inline=False)
+        await ctx.send(embed=embed)    
