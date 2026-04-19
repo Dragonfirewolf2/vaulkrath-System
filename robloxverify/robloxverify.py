@@ -71,6 +71,19 @@ async def roblox_group_rank(roblox_id, group_id):
     return None
 
 
+async def roblox_subgroup_rank(roblox_id, subgroup_ids):
+    """Return rank name string for user in any of the given Roblox sub-groups, or None."""
+    if not roblox_id or not subgroup_ids:
+        return None
+    data = await fetch_json(f"https://groups.roblox.com/v1/users/{roblox_id}/groups/roles")
+    if not data:
+        return None
+    for g in data.get("data", []):
+        if g["group"]["id"] in subgroup_ids:
+            return g["role"]["name"]
+    return None
+
+
 # ─────────── Bloxlink helpers ───────────
 
 async def bloxlink_discord_to_roblox(discord_id, guild_id, api_key):
@@ -203,6 +216,8 @@ class RobloxVerify(commands.Cog):
             group_id=None,
             rank_role_bindings={},   # dict: rank_name -> role_id
             include_in_sync=True,    # whether to include this guild in cross-guild sync
+            subgroup_nickname_mode=False,  # if True, nickname is "roblox_name | sub_group_rank"
+            subgroup_ids=[],         # list of Roblox group IDs to check for sub-group rank
         )
 
     # ─────────── Public methods (used by other cogs) ───────────
@@ -275,7 +290,18 @@ class RobloxVerify(commands.Cog):
         if cfg.get("apply_nickname", True) and guild.me and guild.me.guild_permissions.manage_nicknames:
             try:
                 if member != guild.owner and member.top_role < guild.me.top_role:
-                    await member.edit(nick=roblox_username, reason="Roblox verified")
+                    nick = roblox_username
+                    # Sub-group nickname mode: append sub-group rank like "Name | Ravager"
+                    if cfg.get("subgroup_nickname_mode"):
+                        subgroup_ids = cfg.get("subgroup_ids") or []
+                        if subgroup_ids:
+                            stored_rid = await self.config.user(member).roblox_id()
+                            if stored_rid:
+                                sub_rank = await roblox_subgroup_rank(int(stored_rid), subgroup_ids)
+                                if sub_rank:
+                                    nick = f"{roblox_username} | {sub_rank}"
+                    # Discord nickname limit is 32 chars
+                    await member.edit(nick=nick[:32], reason="Roblox verified")
             except discord.HTTPException:
                 pass
 
@@ -591,6 +617,38 @@ class RobloxVerify(commands.Cog):
         await self.config.guild(ctx.guild).include_in_sync.set(on_off)
         await ctx.send(f"Cross-guild sync for this server: **{'on' if on_off else 'off'}**.")
 
+    @rverifyset.command(name="subgroupnick")
+    async def set_subgroup_nick(self, ctx: commands.Context, on_off: bool):
+        """Toggle sub-group nickname mode. When on, nicknames become 'RobloxName | SubGroupRank'."""
+        await self.config.guild(ctx.guild).subgroup_nickname_mode.set(on_off)
+        await ctx.send(f"Sub-group nickname mode: **{'on' if on_off else 'off'}**.")
+
+    @rverifyset.command(name="subgroupadd")
+    async def add_subgroup(self, ctx: commands.Context, group_id: int):
+        """Add a Roblox group ID to track for sub-group nickname rank."""
+        async with self.config.guild(ctx.guild).subgroup_ids() as ids:
+            if group_id in ids:
+                return await ctx.send(f"Group `{group_id}` is already tracked.")
+            ids.append(group_id)
+        await ctx.send(f"Added group `{group_id}` to sub-group tracking.")
+
+    @rverifyset.command(name="subgroupremove")
+    async def remove_subgroup(self, ctx: commands.Context, group_id: int):
+        """Remove a Roblox group ID from sub-group tracking."""
+        async with self.config.guild(ctx.guild).subgroup_ids() as ids:
+            if group_id not in ids:
+                return await ctx.send(f"Group `{group_id}` isn't tracked.")
+            ids.remove(group_id)
+        await ctx.send(f"Removed group `{group_id}` from sub-group tracking.")
+
+    @rverifyset.command(name="subgrouplist")
+    async def list_subgroups(self, ctx: commands.Context):
+        """List currently tracked sub-group IDs."""
+        ids = await self.config.guild(ctx.guild).subgroup_ids()
+        if not ids:
+            return await ctx.send("No sub-groups tracked.")
+        await ctx.send("Tracked sub-groups:\n" + "\n".join(f"• `{gid}`" for gid in ids))
+
     @rverifyset.command(name="show")
     async def show(self, ctx: commands.Context):
         """Show current settings for this server."""
@@ -612,4 +670,13 @@ class RobloxVerify(commands.Cog):
         embed.add_field(name="Bloxlink key", value="✅ Set" if data["bloxlink_api_key"] else "❌ Not set", inline=False)
         embed.add_field(name="Include in cross-guild sync", value="Yes" if data.get("include_in_sync", True) else "No", inline=False)
         embed.add_field(name="Rank → Role bindings", value=bindings_text, inline=False)
-        await ctx.send(embed=embed)    
+
+        # Sub-group info
+        sub_mode = data.get("subgroup_nickname_mode", False)
+        sub_ids = data.get("subgroup_ids") or []
+        sub_summary = f"{'On' if sub_mode else 'Off'}"
+        if sub_mode and sub_ids:
+            sub_summary += f" (tracking {len(sub_ids)} group(s))"
+        embed.add_field(name="Sub-group nickname mode", value=sub_summary, inline=False)
+
+        await ctx.send(embed=embed)
