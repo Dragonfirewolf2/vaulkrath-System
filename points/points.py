@@ -17,6 +17,9 @@ class MoonlightPoints(commands.Cog):
     def __init__(self, bot: Red):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=92710047, force_registration=True)
+        self.config.register_global(
+            global_log_channel_id=None,  # bot-owner-configurable, logs everything from every guild
+        )
         self.config.register_guild(
             log_channel_id=None,
             allowed_role_ids=[],
@@ -129,13 +132,21 @@ class MoonlightPoints(commands.Cog):
         return embed
 
     async def _log_points(self, guild: discord.Guild, action: str, actor, target, delta: int, new_total: int):
-        channel_id = await self.config.guild(guild).log_channel_id()
-        if not channel_id:
-            return
-        channel = guild.get_channel(channel_id)
-        if not channel:
+        # Per-guild log first; fall back to global log if not set.
+        channel = None
+        guild_channel_id = await self.config.guild(guild).log_channel_id()
+        if guild_channel_id:
+            channel = guild.get_channel(guild_channel_id)
+
+        if channel is None:
+            global_id = await self.config.global_log_channel_id()
+            if global_id:
+                channel = self.bot.get_channel(global_id)
+
+        if channel is None:
             return
 
+        # Thumbnail: prefer the guild where the action happened
         thumb = await self.config.guild(guild).thumbnail_url()
         color = 0x57f287 if action == "added" else 0xed4245
         embed = discord.Embed(
@@ -145,6 +156,7 @@ class MoonlightPoints(commands.Cog):
         )
         if thumb:
             embed.set_thumbnail(url=thumb)
+        embed.add_field(name="Server", value=guild.name, inline=False)
         embed.add_field(name="Actor", value=f"{actor.mention} (`{actor.id}`)", inline=False)
         embed.add_field(name="Target", value=f"{target.mention} (`{target.id}`)", inline=False)
         sign = "+" if action == "added" else "-"
@@ -307,9 +319,39 @@ class MoonlightPoints(commands.Cog):
 
         db_status = "✅ Connected" if self.pool else "❌ Not connected (DATABASE_URL missing)"
 
+        global_id = await self.config.global_log_channel_id()
+        global_ch = self.bot.get_channel(global_id) if global_id else None
+        if global_ch:
+            global_display = f"{global_ch.mention} in **{global_ch.guild.name}**"
+        elif global_id:
+            global_display = f"`{global_id}` (not accessible to bot)"
+        else:
+            global_display = "Not set"
+
         embed = discord.Embed(title="MoonlightPoints Settings", color=0x5865f2)
         embed.add_field(name="Database", value=db_status, inline=False)
-        embed.add_field(name="Log channel", value=ch.mention if ch else "Not set", inline=False)
+        embed.add_field(name="This server's log channel", value=ch.mention if ch else "Not set", inline=False)
+        embed.add_field(name="Global log channel (fallback)", value=global_display, inline=False)
         embed.add_field(name="Allowed roles", value="\n".join(roles) or "None (admins only)", inline=False)
         embed.add_field(name="Thumbnail", value="Set" if data.get("thumbnail_url") else "Not set", inline=False)
         await ctx.send(embed=embed)
+
+    # ─────────── Bot-owner: cross-guild global log channel ───────────
+
+    @pointsset.command(name="globallog")
+    @commands.is_owner()
+    async def set_global_log(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """[Bot owner] Set a single channel that receives logs from ALL guilds.
+
+        Per-guild log channels (set with `logchannel`) take priority. The global
+        channel is used only for guilds that have no per-guild channel configured.
+        Pass no channel to clear.
+        """
+        if channel is None:
+            await self.config.global_log_channel_id.set(None)
+            return await ctx.send("Global log channel cleared.")
+        await self.config.global_log_channel_id.set(channel.id)
+        await ctx.send(
+            f"Global log channel set to {channel.mention} in **{channel.guild.name}**.\n"
+            f"Guilds without a per-guild log will log here."
+        )
