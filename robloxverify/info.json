@@ -1,0 +1,12 @@
+{
+    "author": ["Dragonfirewolf2"],
+    "name": "RobloxVerify",
+    "short": "Roblox account verification via profile code.",
+    "description": "Verify users' Roblox accounts by having them paste a code into their profile description, Bloxlink required.",
+    "tags": ["roblox", "verification"],
+    "requirements": ["aiohttp"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
