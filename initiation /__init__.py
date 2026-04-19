@@ -1,4 +1,4 @@
-from .initiation import RitualInitiation
+from .initiation import MoonlightRitual
 
 
 async def setup(bot):
