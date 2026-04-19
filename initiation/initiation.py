@@ -87,12 +87,42 @@ class MoonlightRitual(commands.Cog):
     def __init__(self, bot: Red):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=92710043, force_registration=True)
+        self.config.register_global(
+            global_ritual_log_channel_id=None,
+            global_rank_announcement_channel_id=None,
+        )
         self.config.register_guild(
             ritual_log_channel_id=None,
             rank_announcement_channel_id=None,
             allowed_role_ids=[],  # Roles allowed to run /ritual
             newborn_rank_name="Newborn",
         )
+
+    # ─────────── Channel resolution ───────────
+
+    async def _get_log_channel(self, guild: discord.Guild):
+        """Return the ritual log channel: per-guild if set, else global fallback."""
+        local_id = await self.config.guild(guild).ritual_log_channel_id()
+        if local_id:
+            ch = guild.get_channel(local_id)
+            if ch:
+                return ch
+        global_id = await self.config.global_ritual_log_channel_id()
+        if global_id:
+            return self.bot.get_channel(global_id)
+        return None
+
+    async def _get_rank_channel(self, guild: discord.Guild):
+        """Return the rank announcement channel: per-guild if set, else global fallback."""
+        local_id = await self.config.guild(guild).rank_announcement_channel_id()
+        if local_id:
+            ch = guild.get_channel(local_id)
+            if ch:
+                return ch
+        global_id = await self.config.global_rank_announcement_channel_id()
+        if global_id:
+            return self.bot.get_channel(global_id)
+        return None
 
     # ─────────── Helpers ───────────
 
@@ -126,6 +156,7 @@ class MoonlightRitual(commands.Cog):
             ),
             color=0x2b2d31,
         )
+        log_embed.add_field(name="Server", value=guild.name, inline=False)
         log_embed.add_field(name="Proof", value="See attached image.", inline=False)
         if event.get("witnesses"):
             log_embed.add_field(
@@ -150,7 +181,7 @@ class MoonlightRitual(commands.Cog):
         )
         members_embed.set_footer(text=f"Total: {len(user_ids)} member(s)")
 
-        log_channel = self.bot.get_channel(cfg["ritual_log_channel_id"]) if cfg["ritual_log_channel_id"] else None
+        log_channel = await self._get_log_channel(guild)
         if log_channel:
             try:
                 await log_channel.send(embeds=[log_embed, members_embed])
@@ -158,7 +189,7 @@ class MoonlightRitual(commands.Cog):
                 pass
 
         # ── Rank each initiate to Newborn ──
-        rank_channel = self.bot.get_channel(cfg["rank_announcement_channel_id"]) if cfg["rank_announcement_channel_id"] else None
+        rank_channel = await self._get_rank_channel(guild)
         newborn_rank = cfg.get("newborn_rank_name", "Newborn")
 
         for uid in user_ids:
@@ -357,9 +388,60 @@ class MoonlightRitual(commands.Cog):
             r = ctx.guild.get_role(rid)
             allowed_roles.append(r.mention if r else f"`{rid}` (missing)")
 
+        # Global fallbacks
+        global_log_id = await self.config.global_ritual_log_channel_id()
+        global_rank_id = await self.config.global_rank_announcement_channel_id()
+        global_log_ch = self.bot.get_channel(global_log_id) if global_log_id else None
+        global_rank_ch = self.bot.get_channel(global_rank_id) if global_rank_id else None
+
+        def _format_global(ch, gid):
+            if ch:
+                return f"{ch.mention} in **{ch.guild.name}**"
+            if gid:
+                return f"`{gid}` (not accessible)"
+            return "Not set"
+
         embed = discord.Embed(title="MoonlightRitual Settings", color=0x5865f2)
-        embed.add_field(name="Log channel", value=log_ch.mention if log_ch else "Not set", inline=False)
-        embed.add_field(name="Rank channel", value=rank_ch.mention if rank_ch else "Not set", inline=False)
+        embed.add_field(name="This server's log channel", value=log_ch.mention if log_ch else "Not set", inline=False)
+        embed.add_field(name="Global log channel (fallback)", value=_format_global(global_log_ch, global_log_id), inline=False)
+        embed.add_field(name="This server's rank channel", value=rank_ch.mention if rank_ch else "Not set", inline=False)
+        embed.add_field(name="Global rank channel (fallback)", value=_format_global(global_rank_ch, global_rank_id), inline=False)
         embed.add_field(name="Allowed roles", value="\n".join(allowed_roles) or "None (admins only)", inline=False)
         embed.add_field(name="Newborn rank", value=f"`{data['newborn_rank_name']}`", inline=False)
         await ctx.send(embed=embed)
+
+    # ─────────── Bot-owner: cross-guild global channels ───────────
+
+    @ritualset.command(name="globallog")
+    @commands.is_owner()
+    async def set_global_log(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """[Bot owner] Set a channel that receives ritual logs from ALL guilds.
+
+        Per-guild log channels (set with `logchannel`) take priority.
+        Pass no channel to clear.
+        """
+        if channel is None:
+            await self.config.global_ritual_log_channel_id.set(None)
+            return await ctx.send("Global ritual log channel cleared.")
+        await self.config.global_ritual_log_channel_id.set(channel.id)
+        await ctx.send(
+            f"Global ritual log set to {channel.mention} in **{channel.guild.name}**.\n"
+            f"Guilds without a per-guild log will log here."
+        )
+
+    @ritualset.command(name="globalrank")
+    @commands.is_owner()
+    async def set_global_rank(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        """[Bot owner] Set a channel that receives rank announcements from ALL guilds.
+
+        Per-guild rank channels (set with `rankchannel`) take priority.
+        Pass no channel to clear.
+        """
+        if channel is None:
+            await self.config.global_rank_announcement_channel_id.set(None)
+            return await ctx.send("Global rank announcement channel cleared.")
+        await self.config.global_rank_announcement_channel_id.set(channel.id)
+        await ctx.send(
+            f"Global rank channel set to {channel.mention} in **{channel.guild.name}**.\n"
+            f"Guilds without a per-guild rank channel will post here."
+        )
