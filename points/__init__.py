@@ -1,5 +1,5 @@
-from .points import Points
+from .moonlight_points import MoonlightPoints
 
 
 async def setup(bot):
-    await bot.add_cog(Points(bot))
+    await bot.add_cog(MoonlightPoints(bot))
