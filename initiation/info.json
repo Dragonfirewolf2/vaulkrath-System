@@ -1,0 +1,15 @@
+{
+    "author": ["Dragonfirewolf2"],
+    "name": "Initiation",
+    "short": "Log initiation rituals and auto-rank initiates.",
+    "description": "Provides /ritual command to log initiation rituals with proof image, witnesses, and assistants. Initiated members are automatically ranked to the newborn rank on Roblox (via RobloxVerify) and across all configured guilds. Requires RobloxVerify cog to be loaded.",
+    "tags": ["roblox", "moonlight", "ritual"],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "required_cogs": {
+        "robloxverify": "https://github.com/Dragonfirewolf2/ISTAR-Project"
+    }
+}
