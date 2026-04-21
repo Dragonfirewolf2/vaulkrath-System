@@ -1,0 +1,12 @@
+{
+    "author": ["Dragonfirewolf2"],
+    "name": "RobloxVerify",
+    "short": "Roblox account verification with Bloxlink + multi-guild role sync.",
+    "description": "Verify users' Roblox accounts via Bloxlink or profile-code fallback. Supports cross-guild role/nickname sync and Roblox group rank → Discord role bindings. Optionally auto-ranks users on Roblox via rblx-open-cloud (requires ROBLOX_API_KEY env var).",
+    "tags": ["roblox", "verification", "bloxlink"],
+    "requirements": ["aiohttp", "rblx-open-cloud"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
